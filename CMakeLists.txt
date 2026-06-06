@@ -6,10 +6,17 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+add_subdirectory(protobuf)
+add_subdirectory(google-play-api)
+
 set(XAL_ANDROID_COMPAT_INCLUDE_DIR "" CACHE PATH "Optional fallback include root for Android-specific XAL headers missing from some GDK snapshots")
 set(LIBHTTPCLIENT_ANDROID_COMPAT_INCLUDE_DIR "" CACHE PATH "Optional fallback include root for Android-only libHttpClient headers missing from some GDK snapshots")
 set(RAPIDJSON_INCLUDE_DIR "" CACHE PATH "Path to the rapidjson include directory")
 set(MCPE_LIB_DIR "" CACHE PATH "Directory containing libminecraftpe.so and libHttpClient.Android.so")
+
+find_package(Protobuf)
+
+protobuf_generate_cpp(PROTO_SRCS PROTO_HDRS mcs.proto)
 
 add_library(minecraftpe SHARED IMPORTED GLOBAL)
 set_target_properties(minecraftpe PROPERTIES
@@ -22,7 +29,7 @@ set_target_properties(libhttpclient_android PROPERTIES
 )
 
 add_library(minimal_invite_rta_client SHARED
-    src/MinimalInviteRtaClient.cpp
+    src/MinimalInviteRtaClient.cpp ${PROTO_SRCS}
 )
 
 target_include_directories(minimal_invite_rta_client
@@ -32,6 +39,7 @@ target_include_directories(minimal_invite_rta_client
         "${XAL_ANDROID_COMPAT_INCLUDE_DIR}"
         "${LIBHTTPCLIENT_ANDROID_COMPAT_INCLUDE_DIR}"
         "${RAPIDJSON_INCLUDE_DIR}"
+        "${CMAKE_CURRENT_BINARY_DIR}"
 )
 
 target_link_libraries(minimal_invite_rta_client
@@ -39,6 +47,11 @@ target_link_libraries(minimal_invite_rta_client
         minecraftpe
         libhttpclient_android
         log
+        libprotobuf
+        ssl
+        crypto
+
+        gplayapi
 )
 
 target_compile_options(minimal_invite_rta_client PRIVATE
