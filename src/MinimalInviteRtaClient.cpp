@@ -21,6 +21,10 @@
 #include <utility>
 #include <vector>
 #include <thread>
+#include <fstream>
+#include <zlib.h>
+#include <playapi/checkin.h>
+#include <playapi/device_info.h>
 
 namespace rapidjson
 {
@@ -130,6 +134,48 @@ std::string BuildRtaRegistrationPayload(
     document.Accept(writer);
     return buffer.GetString();
 }
+
+std::string BuildFCMRegistrationPayload(
+    const std::string& systemId,
+    const std::string& resourceUri,
+    uint32_t titleId,
+    const std::string& locale)
+{
+    JsonDocument document;
+    document.SetObject();
+    auto& allocator = document.GetAllocator();
+
+    document.AddMember("systemId", JsonValue(systemId.c_str(), allocator), allocator);
+    document.AddMember("endpointUri", JsonValue(resourceUri.c_str(), allocator), allocator);
+    document.AddMember("platform", "Android", allocator);
+    document.AddMember("transport", "FCM", allocator);
+    document.AddMember("locale", JsonValue(locale.c_str(), allocator), allocator);
+
+    std::string titleIdString = std::to_string(titleId);
+    document.AddMember("titleId", JsonValue(titleIdString.c_str(), allocator), allocator);
+
+    JsonValue filters(::rapidjson::kArrayType);
+
+    auto addFilter = [&allocator, &filters](int source, int type)
+    {
+        JsonValue filter(::rapidjson::kObjectType);
+        filter.AddMember("action", "Include", allocator);
+        filter.AddMember("source", source, allocator);
+        filter.AddMember("type", type, allocator);
+        filters.PushBack(filter, allocator);
+    };
+
+    addFilter(6, 1);
+    addFilter(6, 8);
+    addFilter(8, 1);
+    document.AddMember("filters", filters, allocator);
+
+    ::rapidjson::StringBuffer buffer;
+    ::rapidjson::Writer<::rapidjson::StringBuffer> writer(buffer);
+    document.Accept(writer);
+    return buffer.GetString();
+}
+
 
 HRESULT GetSignedRequestData(
     XalUserHandle user,
@@ -779,13 +825,11 @@ HRESULT MinimalInviteRtaClient::RegisterFcmToken(const char* fcmToken)
     const std::string resourceUri = ResourceUri();
 
     constexpr const char* url = "https://notify.xboxlive.com/system/notifications/endpoints";
-    const std::string body = BuildRtaRegistrationPayload(
+    const std::string body = BuildFCMRegistrationPayload(
         m_impl->systemId,
-        resourceUri,
+        fcmToken,
         m_impl->titleId,
-        m_impl->locale,
-        "Win32");
-
+        m_impl->locale);
     const XalHttpHeader signingHeaders[] =
     {
         { "Accept", "application/json" },
@@ -1079,6 +1123,12 @@ extern "C" void Java_com_mojang_minecraftpe_NotificationListenerService_nativePu
 
 static decltype(&XalTryAddDefaultUserSilentlyResult) _XalTryAddDefaultUserSilentlyResult;
 
+HRESULT DeleteInstallationToken(std::string fid, std::string refreshToken);
+HRESULT CreateInstallationToken(std::string& fid, std::string& tkn, std::string& refToken);
+HRESULT RegisterDevice(std::string& tkn, long androidId, long securityToken, std::string fid, std::string installToken);
+HRESULT ListenMTalk(long androidId, long securityToken);
+HRESULT GetAuthToken(std::string fid, std::string refreshToken, std::string& tkn);
+
 static HRESULT mockXalTryAddDefaultUserSilentlyResult(XAsyncBlock* async, XalUserHandle* newUser) {
     using namespace minimal_invite_rta;
     HRESULT hr = _XalTryAddDefaultUserSilentlyResult(async, newUser);
@@ -1086,32 +1136,443 @@ static HRESULT mockXalTryAddDefaultUserSilentlyResult(XAsyncBlock* async, XalUse
         XalUserHandle user;
         XalUserDuplicateHandle(*newUser, &user);
         std::thread([user]() {
+            std::string fid;
+            std::string tkn;
+            std::string refToken;
+            std::string installation = "/data/data/com.mojang.minecraftpe/installation.json";
+            long android_Id = 0;
+            long security_token = 0;
+            std::ifstream in(installation);
+            if (in.is_open()) {
+                rapidjson::Document document;
+                std::stringstream ss;
+                ss << in.rdbuf();
+                document.Parse(ss.str().data());
+                if (document.IsObject() && document.HasMember("fid") && document.HasMember("refToken") && document["fid"].IsString() && document["refToken"].IsString()) {
+                    fid = document["fid"].GetString();
+                    refToken = document["refToken"].GetString();
+                    android_Id = std::stol(document["android_id"].GetString());
+                    security_token = std::stol(document["security_token"].GetString());
+                    GetAuthToken(fid, refToken, tkn);
+                }
+            } else {
+                playapi::device_info device;
+                playapi::checkin_api checkin(device);
+                auto checkinResult = checkin.perform_anonymous_checkin()->call();
+                android_Id = checkinResult.android_id;
+                security_token = checkinResult.security_token;
+
+                CreateInstallationToken(fid, tkn, refToken);
+
+                rapidjson::Document document;
+                document.SetObject();
+                auto& allocator = document.GetAllocator();
+
+                document.AddMember("fid", rapidjson::Value(fid.c_str(), allocator), allocator);
+                document.AddMember("refToken", rapidjson::Value(refToken.c_str(), allocator), allocator);
+
+                RegisterDevice(tkn, android_Id, security_token, fid, tkn);
+
+                document.AddMember("android_id", rapidjson::Value(std::to_string(android_Id).c_str(), allocator), allocator);
+                document.AddMember("security_token", rapidjson::Value(std::to_string(security_token).c_str(), allocator), allocator);
+
+                ::rapidjson::StringBuffer buffer;
+                ::rapidjson::Writer<::rapidjson::StringBuffer> writer(buffer);
+                document.Accept(writer);
+
+                std::ofstream out(installation);
+                out << buffer.GetString();
+                out.close();
+            }
+
+            // RegisterDevice(tkn);
             MinimalInviteRtaClient::Config conf;
             conf.user = user;
             XalUserGetId(conf.user, &conf.xuid);
             conf.titleId = 0x67b57dac;
 
             static auto client = MinimalInviteRtaClient::Create(conf);
-            client->RegisterFcmToken(nullptr);
-            client->SetInviteHandler([&](const InviteEvent& ev) {
-                printf("Invite %s\n", ev.senderGamertag.c_str());
-                printf("sessionName %s\n", ev.sessionReference.sessionName.c_str());
-                printf("templateName %s\n", ev.sessionReference.templateName.c_str());
-                printf("senderXboxUserId %lld\n", (long long)ev.senderXboxUserId);
-                printf("invitedXboxUserId %lld\n", (long long)ev.invitedXboxUserId);
-                printf("inviteHandleId %s\n", ev.inviteHandleId.c_str());
-                printf("inviteContext %s\n", ev.inviteContext.c_str());
-                JNIEnv* env;
-                _vm->GetEnv((void**)&env, JNI_VERSION_1_6);
-                Java_com_mojang_minecraftpe_NotificationListenerService_nativePushNotificationReceived(env, nullptr, 1, env->NewStringUTF(ev.senderGamertag.c_str()), env->NewStringUTF("You have been invited"), env->NewStringUTF(ev.inviteHandle.c_str()));
-            });
-            client->SetStateHandler([&](bool connected) {
-                printf("State Event %d\n", (int)connected);
-            });
-            client->Connect();
+            client->RegisterFcmToken(tkn.data());
+            ListenMTalk(android_Id, security_token);
         }).detach();
     }
     return hr;
+}
+
+struct defer {
+    std::function<void()> d;
+    defer(std::function<void()> && d) : d(d) {}
+    void release() {
+        d = []() {};
+    }
+    ~defer() {
+        d();
+    }
+};
+
+#define HRET(body) {\
+HRESULT hr = body;\
+if(FAILED(hr)) {\
+    return hr;\
+}\
+}\
+
+#include <mcs.pb.h>
+
+HRESULT CreateInstallationToken(std::string& fid, std::string& tkn, std::string& refToken) {
+    HCCallHandle handle;
+    HRET(HCHttpCallCreate(&handle));
+    defer __close([&]() {
+        HCHttpCallCloseHandle(handle);
+    });
+    HRET(HCHttpCallSetTracing(handle, true));
+    HRET(HCHttpCallRequestSetUrl(handle, "POST", "https://firebaseinstallations.googleapis.com/v1/projects/minecraft-bedrock-57580/installations"));
+    HRET(HCHttpCallRequestSetHeader(handle, "Content-Type", "application/json", true));
+    HRET(HCHttpCallRequestSetHeader(handle, "X-Android-Package", "com.example.fcmlogger", true));
+    HRET(HCHttpCallRequestSetHeader(handle, "X-Android-Cert", "f925e1ababb4bcf8c3a5d225927f0c90fa95af63", true));
+    HRET(HCHttpCallRequestSetHeader(handle, "User-Agent", "Android-GCM/1.5 (OnePlus7T QKQ1.190716.003)", true));
+    HRET(HCHttpCallRequestSetHeader(handle, "x-goog-api-key", "AIzaSyC-QelK5mHbkAkFa-4s_enjDuIGAtNXyB4", false));
+    HRET(HCHttpCallRequestSetRequestBodyString(handle, R"({
+         "fid": "dtDFQmePHh2xIpEo5i-t-o",
+         "appId": "1:486187589451:android:b2331110821fe2304bd2ce",
+         "authVersion": "FIS_v2",
+         "sdkVersion": "a:17.2.0"
+    })"));
+    XAsyncBlock block{};
+    HRET(HCHttpCallPerformAsync(handle, &block));
+    HRET(XAsyncGetStatus(&block, true));
+    uint32_t statusCode;
+    HRET(HCHttpCallResponseGetStatusCode(handle, &statusCode));
+    const char *responseString;
+    HRET(HCHttpCallResponseGetResponseString(handle, &responseString));
+    // "{\n  \"name\": \"projects/486187589451/installations/dqBC1a1Jr82x8tUAbRayKI\",\n  \"fid\": \"dqBC1a1Jr82x8tUAbRayKI\",\n  \"refreshToken\": \"3_AS3qfwKaq0vFEBcx2nQrsuKwF19uV-SybJg1fGTUFHwRrYZVPam9MkKGF-9loKokdI4raILBjrCfKk2H5xccy5JMHMgkS2YQJXkQath86t10J7A\",\n  \"authToken\": {\n    \"token\": \"eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9.eyJhcHBJZCI6IjE6NDg2MTg3NTg5NDUxOmFuZHJvaWQ6YjIzMzExMTA4MjFmZTIzMDRiZDJjZSIsImV4cCI6MTc4MTI5NjYxOSwiZmlkIjoiZHFCQzFhMUpyODJ4OHRVQWJSYXlLSSIsInByb2plY3ROdW1iZXIiOjQ4NjE4NzU4OTQ1MX0.AB2LPV8wRQIhANkyQ3_wbCyOashioTm5wUjHuL3inXfdxuRVM3iV-mBjAiAzkqXw347Sp1pcl-m5zlhaWjUqIsF5CIou4kDgrQssNg\",\n    \"expiresIn\": \"604800s\"\n  }\n}\n"
+    rapidjson::Document json;
+    json.Parse(responseString, strlen(responseString));
+    if (statusCode != 200 || json.HasParseError())
+    {
+        return E_FAIL;
+    }
+    fid = json["fid"].GetString();
+    tkn = json["authToken"]["token"].GetString();
+    refToken = json["refreshToken"].GetString();
+    return S_OK;
+}
+
+HRESULT GetAuthToken(std::string fid, std::string refreshToken, std::string& tkn) {
+    HCCallHandle handle;
+    HRET(HCHttpCallCreate(&handle));
+    defer __close([&]() {
+        HCHttpCallCloseHandle(handle);
+    });
+    HRET(HCHttpCallSetTracing(handle, true));
+    HRET(HCHttpCallRequestSetUrl(handle, "POST", ("https://firebaseinstallations.googleapis.com/v1/projects/minecraft-bedrock-57580/installations/" + fid + "/authTokens:generate").data()));
+    HRET(HCHttpCallRequestSetHeader(handle, "Content-Type", "application/json", true));
+    HRET(HCHttpCallRequestSetHeader(handle, "User-Agent", "Android-GCM/1.5 (OnePlus7T QKQ1.190716.003)", true));
+    HRET(HCHttpCallRequestSetHeader(handle, "x-goog-api-key", "AIzaSyC-QelK5mHbkAkFa-4s_enjDuIGAtNXyB4", false));
+    HRET(HCHttpCallRequestSetHeader(handle, "Authorization", ("FIS_v2 " + refreshToken).data(), false));
+    XAsyncBlock block{};
+    HRET(HCHttpCallPerformAsync(handle, &block));
+    HRET(XAsyncGetStatus(&block, true));
+    uint32_t statusCode;
+    HRET(HCHttpCallResponseGetStatusCode(handle, &statusCode));
+    const char *responseString;
+    HRET(HCHttpCallResponseGetResponseString(handle, &responseString));
+    rapidjson::Document json;
+    json.Parse(responseString, strlen(responseString));
+    if (statusCode != 200 || json.HasParseError())
+    {
+        return E_FAIL;
+    }
+    tkn = json["token"].GetString();
+    return S_OK;
+}
+
+HRESULT DeleteInstallationToken(std::string fid, std::string refreshToken) {
+    HCCallHandle handle;
+    HRET(HCHttpCallCreate(&handle));
+    defer __close([&]() {
+        HCHttpCallCloseHandle(handle);
+    });
+    HRET(HCHttpCallSetTracing(handle, true));
+    HRET(HCHttpCallRequestSetUrl(handle, "DELETE", ("https://firebaseinstallations.googleapis.com/v1/projects/minecraft-bedrock-57580/installations/" + fid).data()));
+    HRET(HCHttpCallRequestSetHeader(handle, "Content-Type", "application/json", true));
+    HRET(HCHttpCallRequestSetHeader(handle, "User-Agent", "Android-GCM/1.5 (OnePlus7T QKQ1.190716.003)", true));
+    HRET(HCHttpCallRequestSetHeader(handle, "x-goog-api-key", "AIzaSyC-QelK5mHbkAkFa-4s_enjDuIGAtNXyB4", false));
+    HRET(HCHttpCallRequestSetHeader(handle, "Authorization", ("FIS_v2 " + refreshToken).data(), false));
+    XAsyncBlock block{};
+    HRET(HCHttpCallPerformAsync(handle, &block));
+    HRET(XAsyncGetStatus(&block, true));
+    uint32_t statusCode;
+    HRET(HCHttpCallResponseGetStatusCode(handle, &statusCode));
+    const char *responseString;
+    HRET(HCHttpCallResponseGetResponseString(handle, &responseString));
+    return S_OK;
+}
+
+HRESULT RegisterDevice(std::string& tkn, long androidId, long securityToken, std::string fid, std::string installToken) {
+    HCCallHandle handle;
+    HRET(HCHttpCallCreate(&handle));
+    defer __close([&]() {
+        HCHttpCallCloseHandle(handle);
+    });
+    HRET(HCHttpCallSetTracing(handle, true));
+    HRET(HCHttpCallRequestSetUrl(handle, "POST", "https://android.clients.google.com/c2dm/register3"));
+    HRET(HCHttpCallRequestSetHeader(handle, "Content-Type", "application/x-www-form-urlencoded", true));
+    HRET(HCHttpCallRequestSetHeader(handle, "User-Agent", "Android-GCM/1.5 (OnePlus7T QKQ1.190716.003)", true));
+    HRET(HCHttpCallRequestSetHeader(handle, "Authorization", ("AidLogin " + std::to_string(androidId) + ":" + std::to_string(securityToken)).data(), false));
+    HRET(HCHttpCallRequestSetRequestBodyString(handle, ("X-Firebase-Client=kotlin%2F1.4.10+fire-analytics%2F19.0.0+android-target-sdk%2F30+android-min-sdk%2F24+fire-core%2F20.0.0+device-name%2FOnePlus7T+device-model%2FOnePlus7T+fire-android%2F29+fire-iid%2F21.0.1+android-installer%2Fcom.android.vending+device-brand%2FOnePlus+fire-installations%2F17.0.0+android-platform%2F+fire-fcm%2F20.1.7_1p&X-Firebase-Client-Log-Type=1&X-Goog-Firebase-Installations-Auth=" + installToken + "&X-app_ver=10000&X-app_ver_name=1.0.0&X-appid=" + fid + "&X-cliv=fcm-23.1.2&X-firebase-app-name-hash=R1dAH9Ui7M-ynoznwBdw01tLxhI&X-gmp_app_id=1%3A486187589451%3Aandroid%3Ab2331110821fe2304bd2ce&X-gmsv=241718022&X-osv=29&X-scope=%2A&X-subtype=486187589451&app=com.example.fcmlogger&app_ver=10000&cert=f7918b406cae8782f94650240bd075fc3c76729e&device=" + std::to_string(androidId) +  "&gcm_ver=241718022&plat=0&sender=486187589451&target_ver=29").data()));
+    XAsyncBlock block{};
+    HRET(HCHttpCallPerformAsync(handle, &block));
+    HRET(XAsyncGetStatus(&block, true));
+    uint32_t statusCode;
+    HRET(HCHttpCallResponseGetStatusCode(handle, &statusCode));
+    const char *responseString;
+    HRET(HCHttpCallResponseGetResponseString(handle, &responseString));
+    
+    if(statusCode == 200) {
+        tkn = responseString + sizeof("TOKEN");
+    }
+    return S_OK;
+}
+
+#include <openssl/ssl.h>
+#include <openssl/tls1.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <netinet/ip.h>
+
+HRESULT SendVarInt(SSL* ssl, int value) {
+    if(value < 0) {
+        return E_FAIL;
+    }
+    while(true) {
+        if ((value & -128) == 0) {
+            char t = (char)value;
+            if(SSL_write(ssl, &t, sizeof(t)) != sizeof(t)) {
+                return E_FAIL;
+            }
+            return S_OK;
+        } else {
+            char t = (char)((value & 0x7f) | 0x80);
+            if(SSL_write(ssl, &t, sizeof(t)) != sizeof(t)) {
+                return E_FAIL;
+            }
+            value >>= 7;
+        }
+    }
+}
+
+HRESULT RecvVarInt(SSL* ssl, int& value) {
+    value = 0;
+    for(int i = 0; ; i++) {
+        char t = 0;
+        if(SSL_read(ssl, &t, sizeof(t)) != sizeof(t)) {
+            return E_FAIL;
+        }
+        value |= (t & 0x7f) << i * 7;
+        if((t & 0x80) == 0) {
+            return S_OK;
+        }
+    }
+}
+
+HRESULT SendMsg(SSL* ssl, int tag, const google::protobuf::MessageLite& msg) {
+    char t = (char)tag;
+    if(SSL_write(ssl, &t, sizeof(t)) != sizeof(t)) {
+        return E_FAIL;
+    }
+    std::string body;
+    if(!msg.SerializeToString(&body)) {
+        return E_FAIL;
+    }
+    if(auto hr = SendVarInt(ssl, (int)body.size()); FAILED(hr)) {
+        return hr;
+    }
+    if(SSL_write(ssl, body.data(), (int)body.size()) != (int)body.size()) {
+        return E_FAIL;
+    }
+    return S_OK;
+}
+
+int SSL_readfull(SSL *ssl, void *buf, int num) {
+    int read = 0;
+    while(read < num) {
+        int r = SSL_read(ssl, (char*)buf + read, num - read);
+        if(r <= 0) {
+            return r;
+        }
+        read += r;
+    }
+    return read;
+}
+
+HRESULT RecvMsg(SSL* ssl,  google::protobuf::MessageLite& msg) {
+    int bodylen = 0;
+    if(auto hr = RecvVarInt(ssl, bodylen); FAILED(hr)) {
+        return hr;
+    }
+    std::string body;
+    body.resize(bodylen);
+    if(SSL_readfull(ssl, body.data(), (int)body.size()) != (int)body.size()) {
+        return E_FAIL;
+    }
+    msg.ParseFromString(body);
+    return S_OK;
+}
+
+HRESULT ListenMTalk(long androidId, long securityToken) {
+    struct addrinfo hints, *result, *ptr;
+	memset(&hints, 0, sizeof(addrinfo));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+
+	if(getaddrinfo("mtalk.google.com", "5228", &hints, &result) != 0) {
+        return E_FAIL;
+    }
+    int fd = -1;
+    for(ptr=result; ptr != NULL ;ptr=ptr->ai_next) {
+        int sock = socket(ptr->ai_family, ptr->ai_socktype, ptr->ai_protocol);
+        if(sock != -1) {
+            if(connect(sock, ptr->ai_addr, (socklen_t)ptr->ai_addrlen) != -1) {
+                fd = sock;
+                break;
+            }
+        }
+    }
+    freeaddrinfo(result);
+    if(fd == -1) {
+        return E_FAIL;
+    }
+
+    auto ssl_ctx = SSL_CTX_new(TLS_client_method());
+    auto ssl = SSL_new(ssl_ctx);
+    SSL_set_fd(ssl, fd);
+
+    int ret = SSL_connect(ssl);
+    if(ret != 1) {
+        int error = SSL_get_error(ssl, ret);
+        SSL_free(ssl);
+        return E_FAIL;
+    }
+
+    char version = 41;
+    int written = SSL_write(ssl, &version, sizeof(version));
+    if(written != sizeof(version)) {
+        int error = SSL_get_error(ssl, written);
+        SSL_free(ssl);
+        return E_FAIL;
+    }
+    version = -1;
+    int read = SSL_read(ssl, &version, sizeof(version));
+    if(read != sizeof(version)) {
+        int error = SSL_get_error(ssl, read);
+        SSL_free(ssl);
+        return E_FAIL;
+    }
+
+    auto req = mcs_proto::LoginRequest{};
+    req.set_id("gms-22.48.14-000");
+    req.set_domain("mcs.android.com");
+    req.set_user(std::to_string(androidId));
+    req.set_resource(std::to_string(androidId));
+    req.set_auth_token(std::to_string(securityToken));
+    req.set_device_id((std::stringstream() << std::hex << "android-" << androidId).str());
+    auto s = req.add_setting();
+    s->set_name("new_vc");
+    s->set_value("1");
+    s = req.add_setting();
+    s->set_name("os_ver");
+    s->set_value("android-14");
+    s = req.add_setting();
+    s->set_name("ERR");
+    s->set_value("20");
+    s = req.add_setting();
+    s->set_name("CT");
+    s->set_value("8");
+    s = req.add_setting();
+    s->set_name("CONOK");
+    s->set_value("3");
+    s = req.add_setting();
+    s->set_name("u:f");
+    s->set_value("0");
+    s = req.add_setting();
+    s->set_name("networkOn");
+    s->set_value("0");
+    // Do not have one on initial login
+    req.add_received_persistent_id("");
+    req.set_adaptive_heartbeat(false);
+    req.set_use_rmq2(true);
+    req.set_auth_service(mcs_proto::LoginRequest_AuthService_ANDROID_ID);
+    req.set_network_type(1);
+    SendMsg(ssl, 2, req);
+
+    while(true) {
+        int tag;
+        RecvVarInt(ssl, tag);
+        switch (tag)
+        {
+        case 0:
+            {
+                mcs_proto::HeartbeatPing msg;
+                RecvMsg(ssl, msg);
+                mcs_proto::HeartbeatAck ack;
+                ack.set_status(msg.status());
+                SendMsg(ssl, 1, ack);
+            }
+            break;
+        case 1:
+            {
+                mcs_proto::HeartbeatAck msg;
+                RecvMsg(ssl, msg);
+            }
+            break;
+        case 3:
+            {
+                mcs_proto::LoginResponse msg;
+                RecvMsg(ssl, msg);
+            }
+            break;
+        case 4:
+            {
+                mcs_proto::Close msg;
+                RecvMsg(ssl, msg);
+            }
+            break;
+        case 7:
+            {
+                mcs_proto::IqStanza msg;
+                RecvMsg(ssl, msg);
+            }
+            break;
+        case 8:
+            {
+                mcs_proto::DataMessageStanza msg;
+                RecvMsg(ssl, msg);
+                for(int i = 0; i < msg.app_data_size(); i++) {
+                    std::string kv = msg.app_data(i).key() + "=" + msg.app_data(i).value();
+                    std::cout << kv << "\n";
+                    if(msg.app_data(i).key() == "xbl") {
+                        rapidjson::Document doc;
+                        doc.Parse(msg.app_data(i).value().data());
+                        JNIEnv* env;
+                        _vm->GetEnv((void**)&env, JNI_VERSION_1_6);
+                        Java_com_mojang_minecraftpe_NotificationListenerService_nativePushNotificationReceived(env, nullptr, 1, env->NewStringUTF((std::string("Invited by ") + doc["invite_handle"]["inviteInfo"]["sender"].GetString()).data()), env->NewStringUTF("You have been invited"), env->NewStringUTF(msg.app_data(i).value().c_str()));
+                    }
+                }
+            }
+            break;
+        
+        default:
+            break;
+        }
+    }
+
+    SSL_free(ssl);
+
+    return S_OK;
 }
 
 MINIMAL_INVITE_RTA_EXPORT void mod_init() {
@@ -1131,4 +1592,95 @@ MINIMAL_INVITE_RTA_EXPORT void mod_init() {
     }
     _XalTryAddDefaultUserSilentlyResult = &XalTryAddDefaultUserSilentlyResult;
     mcpelauncher_relocate(minecraft, "XalTryAddDefaultUserSilentlyResult", (void*)&mockXalTryAddDefaultUserSilentlyResult);
+}
+
+#undef HRET
+#define HRET(x) x
+
+// Return true on success, false on failure
+bool zlib_inflate(const std::vector<uint8_t>& compressed, std::string& out) {
+    z_stream zs{};
+    zs.next_in = const_cast<Bytef*>(compressed.data());
+    zs.avail_in = compressed.size();
+
+    if (inflateInit2(&zs, 15 + 32) != Z_OK) {
+        IF_DEBUG(std::cout << "inflateInit2 failed" << std::endl);
+        return false;
+    }
+
+    char buffer[32768]; // 32 KB chunks
+    int ret;
+    out.clear();
+
+    do {
+        zs.next_out = reinterpret_cast<Bytef*>(buffer);
+        zs.avail_out = sizeof(buffer);
+
+        ret = inflate(&zs, Z_NO_FLUSH);
+        if (ret != Z_OK && ret != Z_STREAM_END) {
+            inflateEnd(&zs);
+            IF_DEBUG(std::cout << "inflate failed with error code: " << ret << std::endl);
+            return false;
+        }
+
+        // Append decompressed chunk
+        out.append(buffer, sizeof(buffer) - zs.avail_out);
+    } while (ret != Z_STREAM_END);
+
+    inflateEnd(&zs);
+    return true;
+}
+
+playapi::http_response playapi::http_request::perform() {
+    std::string method;
+    switch (this->method)
+    {
+    case playapi::http_method::GET:
+        method = (std::string)cryptstring("GET");
+        break;
+    case playapi::http_method::POST:
+        method = (std::string)cryptstring("POST");
+        break;
+    case playapi::http_method::PUT:
+        method = (std::string)cryptstring("PUT");
+        break;
+    default:
+        method = (std::string)cryptstring("GET");
+        break;
+    }
+    HCCallHandle handle;
+    HRET(HCHttpCallCreate(&handle));
+    defer __close([&]() {
+        HCHttpCallCloseHandle(handle);
+    });
+    HRET(HCHttpCallSetTracing(handle, true));
+    HRET(HCHttpCallRequestSetUrl(handle, method.data(), this->url.c_str()));
+    if(body.size() > 0) {
+        HCHttpCallRequestSetRequestBodyBytes(handle, (const uint8_t *)body.data(), body.size());
+    }
+    if(!this->user_agent.empty()) {
+        HRET(HCHttpCallRequestSetHeader(handle, "User-Agent", this->user_agent.data(), true));
+    }
+    for (auto&& h : headers)
+    {
+        HRET(HCHttpCallRequestSetHeader(handle, h.first.c_str(), h.second.c_str(), true));
+    }
+    XAsyncBlock block{};
+    HRET(HCHttpCallPerformAsync(handle, &block));
+    HRET(XAsyncGetStatus(&block, true));
+    uint32_t statusCode;
+    HRET(HCHttpCallResponseGetStatusCode(handle, &statusCode));
+    const char *responseString;
+    size_t len;
+    HCHttpCallResponseGetResponseBodyBytesSize(handle, &len);
+    std::string responseStr;
+    std::vector<uint8_t> compressedResponse(len);
+    HCHttpCallResponseGetResponseBodyBytes(handle, len, (uint8_t*)compressedResponse.data(), NULL);
+
+    if (!zlib_inflate(compressedResponse, responseStr)) {
+        IF_DEBUG(std::cout << "Failed to decompress response" << std::endl);
+        return playapi::http_response(false, statusCode, "");
+    }
+
+    return playapi::http_response(true, statusCode, responseStr);
 }
