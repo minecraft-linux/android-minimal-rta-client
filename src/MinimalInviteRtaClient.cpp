@@ -1422,6 +1422,41 @@ HRESULT RecvMsg(SSL* ssl,  google::protobuf::MessageLite& msg) {
     return S_OK;
 }
 
+std::vector<std::string> parseLocArgs(std::string in) {
+    std::vector<std::string> ret;
+    rapidjson::Document doc;
+    doc.Parse(in.data());
+    if(!doc.HasParseError() && doc.IsArray()) {
+        for(size_t i = 0; i < doc.Size(); i++) {
+            auto&& entry = doc[i];
+            std::string v;
+            if(entry.IsString()) {
+                v = entry.GetString();
+            } else if(entry.IsNumber()) {
+                v = std::to_string(entry.GetDouble());
+            } else if(entry.IsBool()) {
+                v = entry.GetBool() ? "true" : "false";
+            }
+            ret.push_back(v);
+        }
+    }
+    return ret;
+}
+
+std::string placeHolder(const std::string& key, const std::vector<std::string>& args) {
+    std::ostringstream out;
+    out << key;
+    out << " [";
+    for(size_t i = 0; i < args.size(); i++) {
+        if(i != 0) {
+            out << ", ";
+        }
+        out << args[i];
+    }
+    out << "]";
+    return out.str();
+}
+
 HRESULT ListenMTalk(long androidId, long securityToken) {
     struct addrinfo hints, *result, *ptr;
 	memset(&hints, 0, sizeof(addrinfo));
@@ -1509,6 +1544,9 @@ HRESULT ListenMTalk(long androidId, long securityToken) {
     req.set_network_type(1);
     SendMsg(ssl, 2, req);
 
+    JNIEnv* env;
+    _vm->GetEnv((void**)&env, JNI_VERSION_1_6);
+
     while(true) {
         int tag;
         RecvVarInt(ssl, tag);
@@ -1551,17 +1589,31 @@ HRESULT ListenMTalk(long androidId, long securityToken) {
             {
                 mcs_proto::DataMessageStanza msg;
                 RecvMsg(ssl, msg);
+                std::map<std::string, std::string> appData;
                 for(int i = 0; i < msg.app_data_size(); i++) {
-                    std::string kv = msg.app_data(i).key() + "=" + msg.app_data(i).value();
-                    std::cout << kv << "\n";
-                    if(msg.app_data(i).key() == "xbl") {
-                        rapidjson::Document doc;
-                        doc.Parse(msg.app_data(i).value().data());
-                        JNIEnv* env;
-                        _vm->GetEnv((void**)&env, JNI_VERSION_1_6);
-                        Java_com_mojang_minecraftpe_NotificationListenerService_nativePushNotificationReceived(env, nullptr, 1, env->NewStringUTF((std::string("Invited by ") + doc["invite_handle"]["inviteInfo"]["sender"].GetString()).data()), env->NewStringUTF("You have been invited"), env->NewStringUTF(msg.app_data(i).value().c_str()));
-                    }
+                    appData[msg.app_data(i).key()] = msg.app_data(i).value();
                 }
+                jint type;
+                std::vector<std::string> title_args = parseLocArgs(appData["gcm.notification.title_loc_args"]);
+                std::vector<std::string> body_args = parseLocArgs(appData["gcm.notification.body_loc_args"]);
+                std::string title = appData["gcm.notification.title"];
+                std::string body = appData["gcm.notification.body"];
+                if(appData["type"] == "xbox_live_achievement_unlock" && !appData["xbl"].empty()) {
+                    type = 0 /* xbox_live_achievement_unlock */;
+                } else if(appData["type"] == "xbox_live_game_invite" && !appData["xbl"].empty()) {
+                    type = 1 /* xbox_live_game_invite */;
+                    title = "You have been invited";
+                    body = std::string("Invited by ") + (body_args.size() > 0 ? body_args[0] : "Unknown");
+                } else {
+                    type = 2 /* Unknown */;
+                }
+                if(title == "") {
+                    title = placeHolder(appData["gcm.notification.title_loc_key"], title_args);
+                }
+                if(body == "") {
+                    body = placeHolder(appData["gcm.notification.body_loc_key"], body_args);
+                }
+                Java_com_mojang_minecraftpe_NotificationListenerService_nativePushNotificationReceived(env, nullptr, type, env->NewStringUTF(title.c_str()), env->NewStringUTF(body.c_str()), env->NewStringUTF(appData["xbl"].c_str()));
             }
             break;
         
@@ -1570,6 +1622,7 @@ HRESULT ListenMTalk(long androidId, long securityToken) {
         }
     }
 
+    SSL_shutdown(ssl);
     SSL_free(ssl);
 
     return S_OK;
