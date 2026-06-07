@@ -2,6 +2,9 @@ cmake_minimum_required(VERSION 3.22)
 
 project(minimal_invite_rta_client LANGUAGES CXX)
 
+string( REPLACE "-D_FORTIFY_SOURCE=2" "-D_FORTIFY_SOURCE=0" CMAKE_C_FLAGS "${CMAKE_C_FLAGS}" )
+string( REPLACE "-D_FORTIFY_SOURCE=2" "-D_FORTIFY_SOURCE=0" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}" )
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -48,8 +51,6 @@ target_link_libraries(minimal_invite_rta_client
         libhttpclient_android
         log
         libprotobuf
-        ssl
-        crypto
 
         gplayapi
 )
